@@ -285,9 +285,10 @@ p{margin:0 0 1em;}
 .estimate-label{font-weight:700; text-transform:uppercase; letter-spacing:.08em; font-size:.78rem; color:var(--color-teal); margin-bottom:.2em;}
 .estimate-amount{font-family:var(--font-mono); font-size:2.6rem; font-weight:600; color:var(--color-primary); margin-bottom:14px;}
 .estimate-details{display:flex; flex-direction:column; gap:10px; margin:0 0 20px; text-align:left; border-top:1px solid var(--color-border); padding-top:16px;}
-.estimate-details > div{display:flex; justify-content:space-between; font-size:.92rem;}
-.estimate-details dt{color:var(--color-ink-soft);}
-.estimate-details dd{margin:0; font-weight:700;}
+.estimate-details > div{display:flex; justify-content:space-between; font-size:.92rem; gap:12px;}
+.estimate-details > div[hidden]{display:none;}
+.estimate-details dt{color:var(--color-ink-soft); flex-shrink:0;}
+.estimate-details dd{margin:0; font-weight:700; text-align:right;}
 .estimate-error{background:#FDF3EC; border:1px solid #F2C994; border-radius:var(--radius-sm); padding:16px 18px; font-size:.9rem; color:#7A4A0B;}
 .estimate-error[hidden]{display:none;}
 .estimate-error p{margin:0 0 6px;}
@@ -869,6 +870,7 @@ p{margin:0 0 1em;}
               <div><dt>Distance</dt><dd id="estimateDistance">—</dd></div>
               <div><dt>Trip Type</dt><dd id="estimateTripType">—</dd></div>
               <div><dt>Passenger Type</dt><dd id="estimatePassengerType">—</dd></div>
+              <div id="estimateFeesRow" hidden><dt>Additional Fees</dt><dd id="estimateFees">—</dd></div>
             </dl>
             <a href="#booking" class="btn btn-primary btn-block">Book This Ride</a>
           </div>
@@ -1443,6 +1445,8 @@ p{margin:0 0 1em;}
   const estimateDistance = document.getElementById('estimateDistance');
   const estimateTripType = document.getElementById('estimateTripType');
   const estimatePassengerType = document.getElementById('estimatePassengerType');
+  const estimateFeesRow = document.getElementById('estimateFeesRow');
+  const estimateFees = document.getElementById('estimateFees');
 
   const NOMINATIM_URL = 'https://nominatim.openstreetmap.org/search';
   const OSRM_URL = 'https://router.project-osrm.org/route/v1/driving';
@@ -1456,13 +1460,23 @@ p{margin:0 0 1em;}
     return { lat: parseFloat(results[0].lat), lon: parseFloat(results[0].lon) };
   }
 
+  // Guaranteed buffer applied to EVERY trip's distance, regardless of whether
+  // the routing engine finds multiple alternative routes. OSRM (the free routing
+  // engine this site uses) frequently only finds ONE realistic driving path for
+  // straightforward local trips — Google Maps' "3 route options" view uses
+  // Google's own proprietary alternate-route data, which isn't available through
+  // any free service. Padding every distance by a fixed percentage guarantees
+  // headroom on every single trip (detours, closures, weather) instead of only
+  // on the trips where OSRM happens to find a longer alternate.
+  // Adjust this number to match how much variance you actually see in your
+  // service area — 0.20 means every distance is padded by 20%.
+  const ROUTE_BUFFER_PERCENT = 0.20;
+
   async function getDrivingDistanceMiles(pickupAddress, dropoffAddress) {
     const [from, to] = await Promise.all([geocodeAddress(pickupAddress), geocodeAddress(dropoffAddress)]);
-    // alternatives=true asks OSRM for more than one route between the two points.
-    // We deliberately quote off the LONGEST alternative, not the shortest, so the
-    // upfront estimate has built-in headroom for detours, closures, or weather —
-    // the goal is to never have to go back to a customer for more money after a
-    // trip that ran long through no fault of the estimate.
+    // alternatives=true asks OSRM for more than one route between the two points,
+    // when it can find one. We use the longest one it returns, THEN apply the
+    // guaranteed buffer below on top of that — see ROUTE_BUFFER_PERCENT comment.
     const url = `${OSRM_URL}/${from.lon},${from.lat};${to.lon},${to.lat}?overview=false&alternatives=true`;
     const res = await fetch(url);
     if (!res.ok) throw new Error('Routing request failed');
@@ -1471,7 +1485,7 @@ p{margin:0 0 1em;}
     const longestRoute = data.routes.reduce((longest, route) =>
       route.distance > longest.distance ? route : longest
     );
-    const meters = longestRoute.distance;
+    const meters = longestRoute.distance * (1 + ROUTE_BUFFER_PERCENT);
     return meters / 1609.344; // meters -> miles
   }
 
@@ -1483,6 +1497,9 @@ p{margin:0 0 1em;}
        wheelchair, stretcher) — there is no automatic per-type surcharge.
        The optional fees below only apply if the matching checkbox is
        selected in "Additional Options".
+     - $40 after-hours/weekend surcharge: applies to any ride on a Saturday
+       or Sunday, OR any ride with a pickup time before 7:00 AM or after
+       5:00 PM on any day.
      - Example: 11-mile one-way trip -> 100 + (11 * 3) = $133
                 same trip round trip  -> 100 + (11 * 3 * 2) = $166        */
   const PRICING = {
@@ -1491,15 +1508,44 @@ p{margin:0 0 1em;}
     wheelchairAssistFee: 10,
     waitTimeFee: 15,
     additionalPassengerFee: 8,
+    afterHoursFee: 40,
   };
+
+  // Parses the form's date/time fields as LOCAL date/time (avoiding UTC
+  // timezone shifts that plain `new Date("YYYY-MM-DD")` parsing can cause).
+  function isAfterHours(dateStr, timeStr) {
+    if (!dateStr || !timeStr) return false;
+    const [y, m, d] = dateStr.split('-').map(Number);
+    const [hh, mm] = timeStr.split(':').map(Number);
+    const dayOfWeek = new Date(y, m - 1, d).getDay(); // 0 = Sunday, 6 = Saturday
+    const isWeekend = dayOfWeek === 0 || dayOfWeek === 6;
+    const minutesSinceMidnight = hh * 60 + mm;
+    const isBeforeSeven = minutesSinceMidnight < 7 * 60;   // before 7:00 AM
+    const isAfterFive = minutesSinceMidnight > 17 * 60;    // after 5:00 PM
+    return isWeekend || isBeforeSeven || isAfterFive;
+  }
 
   function calculateFare(data, miles) {
     const mileageComponent = miles * PRICING.perMile * (data.tripType === 'round-trip' ? 2 : 1);
     let fare = PRICING.baseFare + mileageComponent;
-    if (data.wheelchairAssist) fare += PRICING.wheelchairAssistFee;
-    if (data.waitTime) fare += PRICING.waitTimeFee;
-    if (data.additionalPassenger) fare += PRICING.additionalPassengerFee;
-    return fare;
+    const appliedFees = [];
+    if (data.wheelchairAssist) {
+      fare += PRICING.wheelchairAssistFee;
+      appliedFees.push('Wheelchair assistance (+$' + PRICING.wheelchairAssistFee.toFixed(2) + ')');
+    }
+    if (data.waitTime) {
+      fare += PRICING.waitTimeFee;
+      appliedFees.push('Wait time (+$' + PRICING.waitTimeFee.toFixed(2) + ')');
+    }
+    if (data.additionalPassenger) {
+      fare += PRICING.additionalPassengerFee;
+      appliedFees.push('Additional passenger (+$' + PRICING.additionalPassengerFee.toFixed(2) + ')');
+    }
+    if (isAfterHours(data.date, data.time)) {
+      fare += PRICING.afterHoursFee;
+      appliedFees.push('After-hours / weekend (+$' + PRICING.afterHoursFee.toFixed(2) + ')');
+    }
+    return { fare, appliedFees };
   }
 
   const passengerLabels = { ambulatory: 'Ambulatory', wheelchair: 'Wheelchair', stretcher: 'Stretcher' };
@@ -1535,12 +1581,20 @@ p{margin:0 0 1em;}
       try {
         const rawMiles = await getDrivingDistanceMiles(data.pickup, data.dropoff);
         const miles = Math.round(rawMiles * 10) / 10; // round once to 1 decimal; used for BOTH display and fare math so the numbers always reconcile
-        const fare = calculateFare(data, miles);
+        const { fare, appliedFees } = calculateFare(data, miles);
 
         estimateAmount.textContent = '$' + fare.toFixed(2);
         estimateDistance.textContent = miles.toFixed(1) + ' miles';
         estimateTripType.textContent = tripLabels[data.tripType] || data.tripType;
         estimatePassengerType.textContent = passengerLabels[data.passengerType] || data.passengerType;
+        if (estimateFeesRow && estimateFees) {
+          if (appliedFees.length) {
+            estimateFees.textContent = appliedFees.join(', ');
+            estimateFeesRow.hidden = false;
+          } else {
+            estimateFeesRow.hidden = true;
+          }
+        }
 
         estimateEmpty.hidden = true;
         estimateContent.hidden = false;
