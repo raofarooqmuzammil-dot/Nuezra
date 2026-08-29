@@ -1458,12 +1458,20 @@ p{margin:0 0 1em;}
 
   async function getDrivingDistanceMiles(pickupAddress, dropoffAddress) {
     const [from, to] = await Promise.all([geocodeAddress(pickupAddress), geocodeAddress(dropoffAddress)]);
-    const url = `${OSRM_URL}/${from.lon},${from.lat};${to.lon},${to.lat}?overview=false`;
+    // alternatives=true asks OSRM for more than one route between the two points.
+    // We deliberately quote off the LONGEST alternative, not the shortest, so the
+    // upfront estimate has built-in headroom for detours, closures, or weather —
+    // the goal is to never have to go back to a customer for more money after a
+    // trip that ran long through no fault of the estimate.
+    const url = `${OSRM_URL}/${from.lon},${from.lat};${to.lon},${to.lat}?overview=false&alternatives=true`;
     const res = await fetch(url);
     if (!res.ok) throw new Error('Routing request failed');
     const data = await res.json();
     if (!data.routes || !data.routes.length) throw new Error('No driving route found between those addresses');
-    const meters = data.routes[0].distance;
+    const longestRoute = data.routes.reduce((longest, route) =>
+      route.distance > longest.distance ? route : longest
+    );
+    const meters = longestRoute.distance;
     return meters / 1609.344; // meters -> miles
   }
 
@@ -1471,12 +1479,15 @@ p{margin:0 0 1em;}
      - $100 flat base fare (charged once per trip, one-way or round trip)
      - $3.00 per mile, charged for the full one-way distance; round trip
        charges mileage in both directions, base fare is NOT doubled
+     - This flat rate applies to every passenger type (ambulatory,
+       wheelchair, stretcher) — there is no automatic per-type surcharge.
+       The optional fees below only apply if the matching checkbox is
+       selected in "Additional Options".
      - Example: 11-mile one-way trip -> 100 + (11 * 3) = $133
                 same trip round trip  -> 100 + (11 * 3 * 2) = $166        */
   const PRICING = {
     baseFare: 100,
     perMile: 3,
-    passengerMultiplier: { ambulatory: 1, wheelchair: 1.25, stretcher: 1.6 },
     wheelchairAssistFee: 10,
     waitTimeFee: 15,
     additionalPassengerFee: 8,
@@ -1484,7 +1495,7 @@ p{margin:0 0 1em;}
 
   function calculateFare(data, miles) {
     const mileageComponent = miles * PRICING.perMile * (data.tripType === 'round-trip' ? 2 : 1);
-    let fare = (PRICING.baseFare + mileageComponent) * (PRICING.passengerMultiplier[data.passengerType] || 1);
+    let fare = PRICING.baseFare + mileageComponent;
     if (data.wheelchairAssist) fare += PRICING.wheelchairAssistFee;
     if (data.waitTime) fare += PRICING.waitTimeFee;
     if (data.additionalPassenger) fare += PRICING.additionalPassengerFee;
@@ -1522,7 +1533,8 @@ p{margin:0 0 1em;}
       if (estimateError) estimateError.hidden = true;
 
       try {
-        const miles = await getDrivingDistanceMiles(data.pickup, data.dropoff);
+        const rawMiles = await getDrivingDistanceMiles(data.pickup, data.dropoff);
+        const miles = Math.round(rawMiles * 10) / 10; // round once to 1 decimal; used for BOTH display and fare math so the numbers always reconcile
         const fare = calculateFare(data, miles);
 
         estimateAmount.textContent = '$' + fare.toFixed(2);
