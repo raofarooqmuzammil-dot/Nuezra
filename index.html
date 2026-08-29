@@ -284,6 +284,11 @@ p{margin:0 0 1em;}
 .estimate-details > div{display:flex; justify-content:space-between; font-size:.92rem;}
 .estimate-details dt{color:var(--color-ink-soft);}
 .estimate-details dd{margin:0; font-weight:700;}
+.estimate-error{background:#FDF3EC; border:1px solid #F2C994; border-radius:var(--radius-sm); padding:16px 18px; font-size:.9rem; color:#7A4A0B;}
+.estimate-error[hidden]{display:none;}
+.estimate-error p{margin:0 0 6px;}
+.estimate-error p:last-child{margin-bottom:0;}
+.estimate-error a{color:#7A4A0B; text-decoration:underline;}
 .estimate-disclaimer{font-size:.78rem; color:var(--color-ink-soft); margin-top:18px; padding-top:16px; border-top:1px solid var(--color-border);}
 
 /* ---------- Booking ---------- */
@@ -861,6 +866,11 @@ p{margin:0 0 1em;}
             <a href="#booking" class="btn btn-primary btn-block">Book This Ride</a>
           </div>
 
+          <div class="estimate-error" id="estimateError" hidden>
+            <p><strong>We couldn't automatically calculate that distance.</strong></p>
+            <p>Please double-check both addresses, or call us at <a href="tel:+17542150301">+1 754-215-0301</a> for an exact quote.</p>
+          </div>
+
           <p class="estimate-disclaimer">Estimated pricing is subject to confirmation. Final pricing may vary based on trip requirements, mileage, wait time, and transportation needs.</p>
         </div>
       </div>
@@ -1406,43 +1416,68 @@ p{margin:0 0 1em;}
   /* ============================================================
      RIDE ESTIMATOR
      ------------------------------------------------------------
-     This is a placeholder pricing model only. Replace calculateFare()
-     with the company's real pricing rules (e.g. via a backend API call
-     to a pricing service, a mileage-lookup API, and confirmed base
-     rates) before using this in production.
+     Distance is calculated for real, in the browser, using two free
+     public services — no API key required:
+       1. Nominatim (OpenStreetMap) geocodes the typed addresses into
+          latitude/longitude.
+       2. OSRM (Open Source Routing Machine) returns the actual driving
+          distance between those two points.
+     These public demo servers are fine for a small business's normal
+     traffic, but they are rate-limited and not backed by an SLA. If
+     ride-estimate volume grows, swap geocodeAddress()/getDrivingDistanceMiles()
+     for the Google Maps Geocoding + Distance Matrix APIs (paid, requires
+     an API key, much higher reliability and rate limits).
      ============================================================ */
   const estimatorForm = document.getElementById('estimatorForm');
   const estimateEmpty = document.getElementById('estimateEmpty');
   const estimateContent = document.getElementById('estimateContent');
+  const estimateError = document.getElementById('estimateError');
   const estimateAmount = document.getElementById('estimateAmount');
   const estimateDistance = document.getElementById('estimateDistance');
   const estimateTripType = document.getElementById('estimateTripType');
   const estimatePassengerType = document.getElementById('estimatePassengerType');
 
-  // INTEGRATION POINT: replace this with a real distance lookup
-  // (e.g. Google Distance Matrix API) instead of a randomized placeholder.
-  function estimateDistanceMiles(pickup, dropoff) {
-    let seed = 0;
-    const str = (pickup + dropoff).toLowerCase();
-    for (let i = 0; i < str.length; i++) seed += str.charCodeAt(i);
-    return 3 + (seed % 22); // 3–24 placeholder miles, deterministic per input
+  const NOMINATIM_URL = 'https://nominatim.openstreetmap.org/search';
+  const OSRM_URL = 'https://router.project-osrm.org/route/v1/driving';
+
+  async function geocodeAddress(address) {
+    const url = `${NOMINATIM_URL}?format=json&limit=1&q=${encodeURIComponent(address)}`;
+    const res = await fetch(url, { headers: { Accept: 'application/json' } });
+    if (!res.ok) throw new Error('Geocoding request failed');
+    const results = await res.json();
+    if (!results.length) throw new Error('Address not found: ' + address);
+    return { lat: parseFloat(results[0].lat), lon: parseFloat(results[0].lon) };
   }
 
-  // INTEGRATION POINT: replace with the company's confirmed pricing rules.
+  async function getDrivingDistanceMiles(pickupAddress, dropoffAddress) {
+    const [from, to] = await Promise.all([geocodeAddress(pickupAddress), geocodeAddress(dropoffAddress)]);
+    const url = `${OSRM_URL}/${from.lon},${from.lat};${to.lon},${to.lat}?overview=false`;
+    const res = await fetch(url);
+    if (!res.ok) throw new Error('Routing request failed');
+    const data = await res.json();
+    if (!data.routes || !data.routes.length) throw new Error('No driving route found between those addresses');
+    const meters = data.routes[0].distance;
+    return meters / 1609.344; // meters -> miles
+  }
+
+  /* Confirmed pricing rules:
+     - $100 flat base fare (charged once per trip, one-way or round trip)
+     - $3.00 per mile, charged for the full one-way distance; round trip
+       charges mileage in both directions, base fare is NOT doubled
+     - Example: 11-mile one-way trip -> 100 + (11 * 3) = $133
+                same trip round trip  -> 100 + (11 * 3 * 2) = $166        */
   const PRICING = {
-    baseFare: 15,
-    perMile: 2.5,
+    baseFare: 100,
+    perMile: 3,
     passengerMultiplier: { ambulatory: 1, wheelchair: 1.25, stretcher: 1.6 },
-    roundTripMultiplier: 1.85,
     wheelchairAssistFee: 10,
     waitTimeFee: 15,
     additionalPassengerFee: 8,
   };
 
   function calculateFare(data, miles) {
-    let fare = PRICING.baseFare + miles * PRICING.perMile;
-    fare *= PRICING.passengerMultiplier[data.passengerType] || 1;
-    if (data.tripType === 'round-trip') fare *= PRICING.roundTripMultiplier;
+    const mileageComponent = miles * PRICING.perMile * (data.tripType === 'round-trip' ? 2 : 1);
+    let fare = (PRICING.baseFare + mileageComponent) * (PRICING.passengerMultiplier[data.passengerType] || 1);
     if (data.wheelchairAssist) fare += PRICING.wheelchairAssistFee;
     if (data.waitTime) fare += PRICING.waitTimeFee;
     if (data.additionalPassenger) fare += PRICING.additionalPassengerFee;
@@ -1453,7 +1488,7 @@ p{margin:0 0 1em;}
   const tripLabels = { 'one-way': 'One-Way', 'round-trip': 'Round Trip' };
 
   if (estimatorForm) {
-    estimatorForm.addEventListener('submit', (e) => {
+    estimatorForm.addEventListener('submit', async (e) => {
       e.preventDefault();
       const formData = new FormData(estimatorForm);
       const data = {
@@ -1473,17 +1508,38 @@ p{margin:0 0 1em;}
         return;
       }
 
-      const miles = estimateDistanceMiles(data.pickup, data.dropoff);
-      const fare = calculateFare(data, miles);
+      const submitBtn = estimatorForm.querySelector('button[type="submit"]');
+      const originalBtnText = submitBtn.textContent;
+      submitBtn.disabled = true;
+      submitBtn.textContent = 'Calculating…';
+      if (estimateError) estimateError.hidden = true;
 
-      estimateAmount.textContent = '$' + fare.toFixed(2);
-      estimateDistance.textContent = miles + ' miles (approx.)';
-      estimateTripType.textContent = tripLabels[data.tripType] || data.tripType;
-      estimatePassengerType.textContent = passengerLabels[data.passengerType] || data.passengerType;
+      try {
+        const miles = await getDrivingDistanceMiles(data.pickup, data.dropoff);
+        const fare = calculateFare(data, miles);
 
-      estimateEmpty.hidden = true;
-      estimateContent.hidden = false;
-      estimateContent.scrollIntoView({ behavior: 'smooth', block: 'nearest' });
+        estimateAmount.textContent = '$' + fare.toFixed(2);
+        estimateDistance.textContent = miles.toFixed(1) + ' miles';
+        estimateTripType.textContent = tripLabels[data.tripType] || data.tripType;
+        estimatePassengerType.textContent = passengerLabels[data.passengerType] || data.passengerType;
+
+        estimateEmpty.hidden = true;
+        estimateContent.hidden = false;
+        estimateContent.scrollIntoView({ behavior: 'smooth', block: 'nearest' });
+      } catch (err) {
+        console.error('Estimate calculation failed:', err);
+        estimateEmpty.hidden = true;
+        estimateContent.hidden = true;
+        if (estimateError) {
+          estimateError.hidden = false;
+          estimateError.scrollIntoView({ behavior: 'smooth', block: 'nearest' });
+        } else {
+          alert("We couldn't automatically calculate that distance. Please call us for an exact quote.");
+        }
+      } finally {
+        submitBtn.disabled = false;
+        submitBtn.textContent = originalBtnText;
+      }
     });
   }
 
